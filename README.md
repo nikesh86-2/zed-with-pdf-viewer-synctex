@@ -5,6 +5,16 @@
 
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
 
+### Native PDF viewer (this fork)
+
+This fork integrates a native PDF viewer directly into Zed. It is not a Zed extension.
+
+Features include PDFium-backed rendering, zoom and navigation, page thumbnails, text search, live reload, PDF links and bidirectional SyncTeX navigation between LaTeX source and PDF.
+
+Linux is currently the validated build platform. Other platforms need validation. This repository provides source code and build instructions rather than packaged release binaries.
+
+See [PDF viewer architecture](crates/pdf_viewer/ARCHITECTURE.md) and [build, testing and maintenance instructions](crates/pdf_viewer/MAINTAINING.md).
+
 ---
 
 ### Installation

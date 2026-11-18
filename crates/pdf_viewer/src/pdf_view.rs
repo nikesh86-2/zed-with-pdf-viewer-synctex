@@ -1,0 +1,2016 @@
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::Context as _;
+use editor::{
+    Editor, EditorEvent, EditorSettings, RevealInFileManager, items::entry_git_aware_label_color,
+};
+use file_icons::FileIcons;
+use futures::channel::oneshot;
+use gpui::{
+    AnyElement, App, Bounds, BoxShadow, ContentMask, Context, Corners, Element, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, Font, GlobalElementId, Hsla, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PinchEvent, Pixels, Point, Render, RenderImage, ScrollEvent,
+    Style, Styled, Subscription, Task, WeakEntity, Window, actions, div, fill, hsla, img, outline,
+    point, px, size,
+};
+use image::{Frame, RgbaImage};
+use kkpdf_zed::{
+    DocumentId, LinkTarget, PageLink, PdfTextSegment, PdfWorker, RenderTicket, RenderedTile,
+    TileRequest,
+};
+use language::File as _;
+use project::{Project, git_store::GitStoreEvent};
+use serde::{Deserialize, Serialize};
+use settings::Settings;
+use smallvec::smallvec;
+use theme_settings::ThemeSettings;
+use ui::{ScrollAxes, Scrollbars, WithScrollbar, prelude::*};
+use util::{ResultExt as _, paths::PathExt};
+use workspace::{
+    ItemId, ItemNavHistory, ItemSettings, Pane, ToolbarItemLocation, Workspace, WorkspaceId,
+    delete_unloaded_items,
+    invalid_item_view::InvalidItemView,
+    item::{HighlightedText, Item, ItemEvent, ProjectItem, SerializableItem, TabContentParams},
+};
+
+use crate::{
+    layout::{
+        MAX_ZOOM, MIN_ZOOM, PAGE_GAP, PageAnchor, PageLayout, TileRect, ZOOM_STEP, ZoomMode,
+        raster_size, tiles_intersecting,
+    },
+    pdf_item::{PdfItem, PdfItemEvent},
+    persistence::PdfViewerDb,
+    scroll::PdfScrollHandle,
+    synctex::{self, PdfBox},
+};
+
+actions!(
+    pdf_viewer,
+    [
+        /// Zoom in.
+        ZoomIn,
+        /// Zoom out.
+        ZoomOut,
+        /// Show pages at their physical size (100%).
+        ActualSize,
+        /// Fit the page width to the view.
+        FitWidth,
+        /// Fit a whole page inside the view.
+        FitPage,
+        /// Go to the next page.
+        NextPage,
+        /// Go to the previous page.
+        PreviousPage,
+        /// Go to the first page.
+        FirstPage,
+        /// Go to the last page.
+        LastPage,
+        /// Scroll up a little.
+        ScrollUp,
+        /// Scroll down a little.
+        ScrollDown,
+        /// Scroll up by one screen.
+        ScrollPageUp,
+        /// Scroll down by one screen.
+        ScrollPageDown,
+        /// Edit the current page number to jump to a page.
+        GoToPage,
+        /// Show or hide the page thumbnails sidebar.
+        ToggleThumbnails,
+        /// Find text in the PDF.
+        FindInPdf,
+        /// Close the PDF search bar.
+        CloseSearch,
+        /// Move to the next PDF search match.
+        NextSearchMatch,
+        /// Move to the previous PDF search match.
+        PreviousSearchMatch,
+    ]
+);
+
+/// Distance scrolled by a single line of mouse wheel or arrow key.
+const LINE_HEIGHT: Pixels = px(40.);
+/// How long the zoom must stay unchanged before pages are re-rasterized at the
+/// new resolution. Until then the existing tiles are scaled, keeping pinch and
+/// resize smooth.
+const RASTER_SETTLE: Duration = Duration::from_millis(120);
+/// Upper bound on GPU memory spent on cached tiles.
+const TILE_CACHE_BYTES: usize = 384 * 1024 * 1024;
+/// Delay before persisting the scroll position after the user stops scrolling.
+const SERIALIZE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// How long the boxes found by a SyncTeX jump stay highlighted.
+const HIGHLIGHT_DURATION: Duration = Duration::from_secs(2);
+/// Space around a highlighted box, in points, so descenders are covered too.
+const HIGHLIGHT_PADDING: f32 = 2.;
+/// How far the mouse may move between pressing and releasing on a link for the
+/// press to count as a click rather than a drag.
+const LINK_CLICK_SLOP: Pixels = px(4.);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TileKey {
+    generation: u64,
+    page_index: usize,
+    /// Raster scale in device pixels per point, multiplied by 1024.
+    scale: u32,
+    column: u32,
+    row: u32,
+}
+
+struct CachedTile {
+    image: Arc<RenderImage>,
+    tile: TileRect,
+    scale: f32,
+    last_used: u64,
+}
+
+struct PendingTile {
+    _ticket: RenderTicket,
+    _task: Task<()>,
+}
+
+#[derive(Default)]
+struct ThumbnailCache {
+    images: HashMap<(u64, usize), Arc<RenderImage>>,
+    pending: HashMap<(u64, usize), PendingTile>,
+    failed: HashSet<(u64, usize)>,
+}
+
+#[derive(Default)]
+struct TileCache {
+    tiles: HashMap<TileKey, CachedTile>,
+    pending: HashMap<TileKey, PendingTile>,
+    failed: HashSet<TileKey>,
+    frame: u64,
+}
+
+impl TileCache {
+    fn bytes(&self) -> usize {
+        self.tiles
+            .values()
+            .map(|tile| tile.tile.width as usize * tile.tile.height as usize * 4)
+            .sum()
+    }
+
+    fn clear(&mut self, window: &mut Window) {
+        for (_, tile) in self.tiles.drain() {
+            window.drop_image(tile.image).log_err();
+        }
+        self.pending.clear();
+        self.failed.clear();
+    }
+
+    /// Evicts least recently used tiles that weren't drawn this frame.
+    fn evict(&mut self, window: &mut Window) {
+        let mut bytes = self.bytes();
+        if bytes <= TILE_CACHE_BYTES {
+            return;
+        }
+        let mut candidates: Vec<_> = self
+            .tiles
+            .iter()
+            .filter(|(_, tile)| tile.last_used < self.frame)
+            .map(|(key, tile)| (tile.last_used, *key))
+            .collect();
+        candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+        for (_, key) in candidates {
+            if bytes <= TILE_CACHE_BYTES {
+                break;
+            }
+            if let Some(tile) = self.tiles.remove(&key) {
+                bytes -= tile.tile.width as usize * tile.tile.height as usize * 4;
+                window.drop_image(tile.image).log_err();
+            }
+        }
+    }
+}
+
+enum PageLinksState {
+    Loading { _task: Task<()> },
+    Loaded(Vec<PageLink>),
+}
+
+/// Links of the pages that have been on screen, for one version of the document.
+#[derive(Default)]
+struct PageLinks {
+    generation: u64,
+    pages: HashMap<usize, PageLinksState>,
+}
+
+enum PageTextState {
+    Loading { _task: Task<()> },
+    Loaded(Vec<PdfTextSegment>),
+}
+
+/// Extracted text segments for pages, tied to one version of the document.
+#[derive(Default)]
+struct PageText {
+    generation: u64,
+    pages: HashMap<usize, PageTextState>,
+}
+
+/// View state persisted across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializedViewState {
+    zoom_mode: ZoomMode,
+    anchor: Option<PageAnchor>,
+}
+
+pub enum PdfViewEvent {
+    TitleChanged,
+    StateChanged,
+}
+
+pub struct PdfView {
+    pdf_item: Entity<PdfItem>,
+    project: Entity<Project>,
+    focus_handle: FocusHandle,
+    scroll: PdfScrollHandle,
+    zoom_mode: ZoomMode,
+    layout: Option<PageLayout>,
+    layout_generation: u64,
+    /// A page position to bring to a viewport-relative point after the next layout.
+    pending_anchor: Option<(PageAnchor, Point<Pixels>)>,
+    /// Zoom that tiles are currently rasterized for; trails the displayed zoom.
+    raster_zoom: Option<f32>,
+    zoom_changed_at: Instant,
+    settle_task: Option<Task<()>>,
+    serialize_task: Option<Task<()>>,
+    drag_position: Option<Point<Pixels>>,
+    tiles: TileCache,
+    thumbnails: ThumbnailCache,
+    page_edit_requested: bool,
+    workspace: Option<WeakEntity<Workspace>>,
+    /// Boxes shown by a SyncTeX jump until `highlight_task` clears them.
+    highlight: Vec<PdfBox>,
+    highlight_task: Option<Task<()>>,
+    links: PageLinks,
+    page_text: PageText,
+    search_editor: Option<Entity<Editor>>,
+    search_subscription: Option<Subscription>,
+    search_query: String,
+    search_current_match: usize,
+    /// Whether the mouse is over a link, which shows a pointing hand.
+    hovering_link: bool,
+    /// A link pressed with the mouse, followed if the button is released close by.
+    pressed_link: Option<(Point<Pixels>, LinkTarget)>,
+    nav_history: Option<ItemNavHistory>,
+    thumbnails_visible: bool,
+}
+
+impl PdfView {
+    pub fn new(
+        pdf_item: Entity<PdfItem>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.subscribe_in(&pdf_item, window, Self::on_pdf_item_event)
+            .detach();
+        let git_store = project.read(cx).git_store().clone();
+        cx.subscribe(&git_store, |_, _, event, cx| {
+            if matches!(event, GitStoreEvent::DiffBaseChanged(_)) {
+                cx.emit(PdfViewEvent::TitleChanged);
+            }
+        })
+        .detach();
+        cx.on_release_in(window, |this, window, _| this.tiles.clear(window))
+            .detach();
+
+        Self {
+            pdf_item,
+            project,
+            focus_handle: cx.focus_handle(),
+            scroll: PdfScrollHandle::default(),
+            zoom_mode: ZoomMode::Auto,
+            layout: None,
+            layout_generation: 0,
+            pending_anchor: None,
+            raster_zoom: None,
+            zoom_changed_at: Instant::now(),
+            settle_task: None,
+            serialize_task: None,
+            drag_position: None,
+            tiles: TileCache::default(),
+            thumbnails: ThumbnailCache::default(),
+            page_edit_requested: false,
+            workspace: None,
+            highlight: Vec::new(),
+            highlight_task: None,
+            links: PageLinks::default(),
+            page_text: PageText::default(),
+            search_editor: None,
+            search_subscription: None,
+            search_query: String::new(),
+            search_current_match: 0,
+            hovering_link: false,
+            pressed_link: None,
+            nav_history: None,
+            thumbnails_visible: false,
+        }
+    }
+
+    /// Absolute path of the PDF on the machine that has it, which is a remote machine
+    /// in remote projects.
+    pub fn path_on_host(&self, cx: &App) -> PathBuf {
+        self.pdf_item.read(cx).path_on_host(cx)
+    }
+
+    fn on_pdf_item_event(
+        &mut self,
+        _: &Entity<PdfItem>,
+        event: &PdfItemEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PdfItemEvent::FileHandleChanged => cx.emit(PdfViewEvent::TitleChanged),
+            // Old tiles stay cached and keep being drawn as placeholders until the
+            // re-rendered tiles arrive, so a reload doesn't flash.
+            PdfItemEvent::Reloaded => self.tiles.failed.clear(),
+        }
+        cx.notify();
+    }
+
+    /// True while page tiles are still being rasterized for the current view.
+    pub fn is_rendering(&self) -> bool {
+        !self.tiles.pending.is_empty()
+    }
+
+    pub fn page_count(&self, cx: &App) -> usize {
+        self.pdf_item.read(cx).document().pages.len()
+    }
+
+    /// Zero-based index of the page at the center of the viewport.
+    pub fn current_page(&self) -> usize {
+        let Some(layout) = &self.layout else {
+            return 0;
+        };
+        let viewport = self.scroll.viewport_bounds();
+        layout.page_at_y(self.scroll.scroll_position().y + viewport.size.height / 2.)
+    }
+
+    pub fn zoom(&self) -> f32 {
+        self.layout.as_ref().map_or(1., |layout| layout.zoom)
+    }
+
+    pub fn zoom_mode(&self) -> ZoomMode {
+        self.zoom_mode
+    }
+
+    pub(crate) fn take_page_edit_request(&mut self) -> bool {
+        std::mem::take(&mut self.page_edit_requested)
+    }
+
+    /// Captures what is at `viewport_point` so it stays there across a relayout.
+    fn anchor_viewport_point(&mut self, viewport_point: Point<Pixels>) {
+        if let Some(layout) = &self.layout
+            && let Some(anchor) = layout.anchor_at(self.scroll.scroll_position() + viewport_point)
+        {
+            self.pending_anchor = Some((anchor, viewport_point));
+        }
+    }
+
+    fn viewport_center(&self) -> Point<Pixels> {
+        let viewport = self.scroll.viewport_bounds();
+        point(viewport.size.width / 2., viewport.size.height / 2.)
+    }
+
+    pub fn set_zoom_mode(
+        &mut self,
+        zoom_mode: ZoomMode,
+        window_point: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let zoom_mode = match zoom_mode {
+            ZoomMode::Fixed(zoom) => ZoomMode::Fixed(zoom.clamp(MIN_ZOOM, MAX_ZOOM)),
+            mode => mode,
+        };
+        if zoom_mode == self.zoom_mode {
+            return;
+        }
+        let viewport = self.scroll.viewport_bounds();
+        let viewport_point = window_point
+            .map(|point| point - viewport.origin)
+            .unwrap_or_else(|| self.viewport_center());
+        self.anchor_viewport_point(viewport_point);
+        self.zoom_mode = zoom_mode;
+        self.state_changed(cx);
+        cx.notify();
+    }
+
+    fn zoom_by(
+        &mut self,
+        factor: f32,
+        window_point: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let zoom = self.zoom() * factor;
+        self.set_zoom_mode(ZoomMode::Fixed(zoom), window_point, cx);
+    }
+
+    pub fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(ZOOM_STEP, None, cx);
+    }
+
+    pub fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(1. / ZOOM_STEP, None, cx);
+    }
+
+    pub fn actual_size(&mut self, _: &ActualSize, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom_mode(ZoomMode::Fixed(1.), None, cx);
+    }
+
+    pub fn fit_width(&mut self, _: &FitWidth, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom_mode(ZoomMode::FitWidth, None, cx);
+    }
+
+    pub fn fit_page(&mut self, _: &FitPage, _: &mut Window, cx: &mut Context<Self>) {
+        let page = self.current_page();
+        self.set_zoom_mode(ZoomMode::FitPage, None, cx);
+        self.go_to_page(page, cx);
+    }
+
+    pub fn toggle_thumbnails(
+        &mut self,
+        _: &ToggleThumbnails,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.thumbnails_visible = !self.thumbnails_visible;
+        cx.notify();
+    }
+
+    fn find_in_pdf(&mut self, _: &FindInPdf, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = if let Some(editor) = &self.search_editor {
+            editor.clone()
+        } else {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(self.search_query.clone(), window, cx);
+                editor
+            });
+
+            let subscription =
+                cx.subscribe_in(&editor, window, |this, editor, event, _window, cx| {
+                    if let EditorEvent::Edited { .. } = event {
+                        this.search_query = editor.read(cx).text(cx);
+                        this.search_current_match = 0;
+
+                        if !this.search_query.trim().is_empty() {
+                            let (document_id, generation, page_count) = {
+                                let item = this.pdf_item.read(cx);
+                                (
+                                    item.document().id,
+                                    item.generation(),
+                                    item.document().pages.len(),
+                                )
+                            };
+
+                            for page_index in 0..page_count {
+                                this.request_page_text(page_index, document_id, generation, cx);
+                            }
+                        }
+
+                        cx.notify();
+                    }
+                });
+
+            self.search_subscription = Some(subscription);
+            self.search_editor = Some(editor.clone());
+            editor
+        };
+
+        editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn navigate_search_match(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let query = self.search_query.trim().to_lowercase();
+        if query.is_empty() {
+            return;
+        }
+
+        let document = self.pdf_item.read(cx).document().clone();
+        let mut matches = Vec::new();
+
+        for page_index in 0..document.pages.len() {
+            let Some(PageTextState::Loaded(segments)) = self.page_text.pages.get(&page_index)
+            else {
+                continue;
+            };
+
+            let mut matching_segments: Vec<_> = segments
+                .iter()
+                .filter(|segment| segment.text.to_lowercase().contains(&query))
+                .collect();
+
+            matching_segments.sort_by(|a, b| a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x)));
+
+            let dimensions = document.pages[page_index];
+            for segment in matching_segments {
+                matches.push(PdfBox {
+                    page_index,
+                    x: segment.x * dimensions.width,
+                    y: segment.y * dimensions.height,
+                    width: segment.width * dimensions.width,
+                    height: segment.height * dimensions.height,
+                });
+            }
+        }
+
+        if matches.is_empty() {
+            return;
+        }
+
+        let len = matches.len() as isize;
+        self.search_current_match =
+            (self.search_current_match as isize + direction).rem_euclid(len) as usize;
+
+        let selected = matches[self.search_current_match];
+        let top_left = PageAnchor {
+            page_index: selected.page_index,
+            x: selected.x,
+            y: selected.y,
+        };
+        let bottom_right = PageAnchor {
+            x: selected.x + selected.width,
+            y: selected.y + selected.height,
+            ..top_left
+        };
+
+        let viewport = self.scroll.viewport_bounds().size;
+        let visible = Bounds::new(self.scroll.scroll_position(), viewport);
+        let on_screen = self.layout.as_ref().is_some_and(|layout| {
+            [top_left, bottom_right].into_iter().all(|anchor| {
+                layout
+                    .position_of(anchor)
+                    .is_some_and(|position| visible.contains(&position))
+            })
+        });
+
+        if !on_screen {
+            self.pending_anchor = Some((
+                top_left,
+                point(viewport.width / 10., (viewport.height / 3.).max(px(48.))),
+            ));
+            self.state_changed(cx);
+        }
+
+        cx.notify();
+    }
+
+    fn next_search_match(&mut self, _: &NextSearchMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_search_match(1, cx);
+    }
+
+    fn previous_search_match(
+        &mut self,
+        _: &PreviousSearchMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_search_match(-1, cx);
+    }
+
+    fn search_match_count(&self) -> usize {
+        let query = self.search_query.trim().to_lowercase();
+        if query.is_empty() {
+            return 0;
+        }
+
+        self.page_text
+            .pages
+            .values()
+            .map(|state| match state {
+                PageTextState::Loaded(segments) => segments
+                    .iter()
+                    .filter(|segment| segment.text.to_lowercase().contains(&query))
+                    .count(),
+                PageTextState::Loading { .. } => 0,
+            })
+            .sum()
+    }
+
+    fn close_search(&mut self, _: &CloseSearch, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_editor = None;
+        self.search_subscription = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn go_to_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        let last = self.page_count(cx).saturating_sub(1);
+        // Applied after layout, so it also works right after a zoom change.
+        self.pending_anchor = Some((
+            PageAnchor {
+                page_index: page_index.min(last),
+                x: 0.,
+                y: 0.,
+            },
+            point(Pixels::ZERO, PAGE_GAP / 2.),
+        ));
+        self.state_changed(cx);
+        cx.notify();
+    }
+
+    /// Highlights `boxes` for a moment, first scrolling the first one a third of the way
+    /// down the view unless it is already fully visible.
+    pub fn reveal_boxes(&mut self, boxes: Vec<PdfBox>, cx: &mut Context<Self>) {
+        let Some(first) = boxes.first().copied() else {
+            return;
+        };
+        let top_left = PageAnchor {
+            page_index: first.page_index,
+            x: first.x,
+            y: first.y,
+        };
+        let bottom_right = PageAnchor {
+            x: first.x + first.width,
+            y: first.y + first.height,
+            ..top_left
+        };
+        let viewport = self.scroll.viewport_bounds().size;
+        let visible = Bounds::new(self.scroll.scroll_position(), viewport);
+        let on_screen = self.layout.as_ref().is_some_and(|layout| {
+            [top_left, bottom_right].into_iter().all(|anchor| {
+                layout
+                    .position_of(anchor)
+                    .is_some_and(|position| visible.contains(&position))
+            })
+        });
+        if !on_screen {
+            // Applied after layout, so it also works for a view that was just opened.
+            self.pending_anchor = Some((
+                top_left,
+                point(viewport.width / 10., (viewport.height / 3.).max(px(48.))),
+            ));
+            self.state_changed(cx);
+        }
+        self.highlight = boxes;
+        self.highlight_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HIGHLIGHT_DURATION).await;
+            this.update(cx, |this, cx| {
+                this.highlight.clear();
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// The page and the point on it, in PDF points, under a window position.
+    fn page_point_at(&self, window_point: Point<Pixels>) -> Option<PageAnchor> {
+        let viewport = self.scroll.viewport_bounds();
+        self.layout
+            .as_ref()?
+            .anchor_at(self.scroll.scroll_position() + (window_point - viewport.origin))
+    }
+
+    /// Starts reading the links of a page unless they are known or being read.
+    fn request_links(
+        &mut self,
+        page_index: usize,
+        document: DocumentId,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.links.generation != generation {
+            self.links = PageLinks {
+                generation,
+                pages: HashMap::new(),
+            };
+        }
+        if self.links.pages.contains_key(&page_index) {
+            return;
+        }
+        let Some(worker) = PdfWorker::global().log_err() else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        worker.links(document, page_index, move |result| {
+            tx.send(result).ok();
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let links = rx
+                .await
+                .context("reading links was cancelled")
+                .and_then(|result| result)
+                .with_context(|| format!("failed to read the links on page {}", page_index + 1))
+                .log_err()
+                .unwrap_or_default();
+            this.update(cx, |this, _| {
+                if this.links.generation == generation {
+                    this.links
+                        .pages
+                        .insert(page_index, PageLinksState::Loaded(links));
+                }
+            })
+            .ok();
+        });
+        self.links
+            .pages
+            .insert(page_index, PageLinksState::Loading { _task: task });
+    }
+
+    /// Starts extracting text from a page unless it is already cached or loading.
+    fn request_page_text(
+        &mut self,
+        page_index: usize,
+        document: DocumentId,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page_text.generation != generation {
+            self.page_text = PageText {
+                generation,
+                pages: HashMap::new(),
+            };
+        }
+        if self.page_text.pages.contains_key(&page_index) {
+            return;
+        }
+        let Some(worker) = PdfWorker::global().log_err() else {
+            return;
+        };
+        let (tx, rx) = oneshot::channel();
+        worker.text_segments(document, page_index, move |result| {
+            tx.send(result).ok();
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let segments = rx
+                .await
+                .context("reading page text was cancelled")
+                .and_then(|result| result)
+                .with_context(|| format!("failed to read text on page {}", page_index + 1))
+                .log_err()
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                if this.page_text.generation == generation {
+                    this.page_text
+                        .pages
+                        .insert(page_index, PageTextState::Loaded(segments));
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.page_text
+            .pages
+            .insert(page_index, PageTextState::Loading { _task: task });
+    }
+
+    /// The link under a window position, once the links of its page are known.
+    fn link_at(&self, window_point: Point<Pixels>) -> Option<&PageLink> {
+        let anchor = self.page_point_at(window_point)?;
+        let PageLinksState::Loaded(links) = self.links.pages.get(&anchor.page_index)? else {
+            return None;
+        };
+        links.iter().find(|link| {
+            (link.x..=link.x + link.width).contains(&anchor.x)
+                && (link.y..=link.y + link.height).contains(&anchor.y)
+        })
+    }
+
+    /// Follows a link: scrolls to its target in the document, remembering where the view
+    /// was so that going back returns there, or opens a web address in the browser.
+    fn follow_link(&mut self, target: LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Page { page_index, x, y } => {
+                self.push_to_nav_history(cx);
+                let last = self.page_count(cx).saturating_sub(1);
+                self.pending_anchor = Some((
+                    PageAnchor {
+                        page_index: page_index.min(last),
+                        x: x.unwrap_or(0.),
+                        y: y.unwrap_or(0.),
+                    },
+                    point(Pixels::ZERO, PAGE_GAP / 2.),
+                ));
+                self.state_changed(cx);
+                cx.notify();
+            }
+            LinkTarget::Uri(uri) => cx.open_url(&uri),
+        }
+    }
+
+    /// The position at the top of the view, which session restore and going back return to.
+    fn top_anchor(&self) -> Option<PageAnchor> {
+        self.layout.as_ref().and_then(|layout| {
+            layout.anchor_at(self.scroll.scroll_position() + point(Pixels::ZERO, PAGE_GAP / 2.))
+        })
+    }
+
+    fn push_to_nav_history(&mut self, cx: &mut Context<Self>) {
+        if let Some(anchor) = self.top_anchor()
+            && let Some(nav_history) = self.nav_history.as_mut()
+        {
+            nav_history.push(Some(anchor), None, cx);
+        }
+    }
+
+    /// Inverse SyncTeX search: opens the source line typeset at a window position.
+    fn show_source_at(
+        &mut self,
+        window_point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(anchor), Some(workspace)) =
+            (self.page_point_at(window_point), self.workspace.clone())
+        else {
+            return;
+        };
+        let remote_client = self.project.read(cx).remote_client();
+        let command = synctex::SyncTexCommand::edit(
+            remote_client
+                .as_ref()
+                .map(|remote_client| remote_client.read(cx)),
+            &self.path_on_host(cx),
+            anchor.page_index,
+            anchor.x,
+            anchor.y,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            let location = match command {
+                Ok(command) => {
+                    cx.background_spawn(async move {
+                        let output = command.run().await?;
+                        Ok(synctex::parse_edit_output(&output))
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            workspace.update_in(cx, |workspace, window, cx| {
+                synctex::open_source(workspace, location, window, cx)
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn next_page(&mut self, _: &NextPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_page(self.current_page() + 1, cx);
+    }
+
+    fn previous_page(&mut self, _: &PreviousPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_page(self.current_page().saturating_sub(1), cx);
+    }
+
+    fn first_page(&mut self, _: &FirstPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll.set_scroll_position(Point::default());
+        self.state_changed(cx);
+        cx.notify();
+    }
+
+    fn last_page(&mut self, _: &LastPage, _: &mut Window, cx: &mut Context<Self>) {
+        let x = self.scroll.scroll_position().x;
+        self.scroll.set_scroll_position(point(x, px(f32::MAX)));
+        self.state_changed(cx);
+        cx.notify();
+    }
+
+    fn scroll_by(&mut self, delta: Point<Pixels>, cx: &mut Context<Self>) {
+        self.pending_anchor = None;
+        self.scroll.scroll_by(delta);
+        self.state_changed(cx);
+        cx.notify();
+    }
+
+    fn scroll_up(&mut self, _: &ScrollUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(point(Pixels::ZERO, LINE_HEIGHT), cx);
+    }
+
+    fn scroll_down(&mut self, _: &ScrollDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(point(Pixels::ZERO, -LINE_HEIGHT), cx);
+    }
+
+    fn screen_height(&self) -> Pixels {
+        (self.scroll.viewport_bounds().size.height - LINE_HEIGHT).max(LINE_HEIGHT)
+    }
+
+    fn scroll_page_up(&mut self, _: &ScrollPageUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(point(Pixels::ZERO, self.screen_height()), cx);
+    }
+
+    fn scroll_page_down(&mut self, _: &ScrollPageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(point(Pixels::ZERO, -self.screen_height()), cx);
+    }
+
+    fn go_to_page_action(&mut self, _: &GoToPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.page_edit_requested = true;
+        cx.notify();
+    }
+
+    fn reveal_in_file_manager(
+        &mut self,
+        _: &RevealInFileManager,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.pdf_item.read(cx).abs_path(cx) {
+            self.project
+                .update(cx, |project, cx| project.reveal_path(&path, cx));
+        }
+    }
+
+    fn handle_scroll_wheel(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let delta = event.delta.pixel_delta(LINE_HEIGHT);
+        if event.modifiers.platform || event.modifiers.control {
+            let factor = (1. + f32::from(delta.y) * 0.01).clamp(0.5, 2.);
+            self.zoom_by(factor, Some(event.position), cx);
+        } else {
+            self.scroll_by(delta, cx);
+        }
+    }
+
+    fn handle_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_by(1. + event.delta, Some(event.position), cx);
+    }
+
+    fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        if event.button == MouseButton::Left && event.modifiers.secondary(cx) {
+            self.show_source_at(event.position, window, cx);
+            return;
+        }
+        if event.button == MouseButton::Left {
+            self.pressed_link = self
+                .link_at(event.position)
+                .map(|link| (event.position, link.target.clone()));
+        }
+        self.drag_position = Some(event.position);
+        cx.notify();
+    }
+
+    fn handle_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let pressed_link = self.pressed_link.take();
+        self.end_drag(cx);
+        if let Some((pressed_at, target)) = pressed_link {
+            let moved = event.position - pressed_at;
+            if moved.x.abs() <= LINK_CLICK_SLOP && moved.y.abs() <= LINK_CLICK_SLOP {
+                self.follow_link(target, cx);
+            }
+        }
+    }
+
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(previous) = self.drag_position else {
+            let hovering_link = self.link_at(event.position).is_some();
+            if hovering_link != self.hovering_link {
+                self.hovering_link = hovering_link;
+                cx.notify();
+            }
+            return;
+        };
+        // The button can be released outside the window, or while another element
+        // has captured the mouse, so a missed mouse-up must not leave us panning.
+        if event.pressed_button.is_none() {
+            self.end_drag(cx);
+            return;
+        }
+        self.drag_position = Some(event.position);
+        self.scroll_by(event.position - previous, cx);
+    }
+
+    fn end_drag(&mut self, cx: &mut Context<Self>) {
+        self.pressed_link = None;
+        if self.drag_position.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Persists the view state once the user has stopped interacting for a moment.
+    fn state_changed(&mut self, cx: &mut Context<Self>) {
+        self.serialize_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SERIALIZE_DEBOUNCE).await;
+            this.update(cx, |_, cx| cx.emit(PdfViewEvent::StateChanged))
+                .ok();
+        }));
+    }
+
+    fn serialized_state(&self) -> SerializedViewState {
+        SerializedViewState {
+            zoom_mode: self.zoom_mode,
+            anchor: self.top_anchor(),
+        }
+    }
+
+    fn restore_state(&mut self, state: SerializedViewState) {
+        self.zoom_mode = state.zoom_mode;
+        if let Some(anchor) = state.anchor {
+            self.pending_anchor = Some((anchor, point(Pixels::ZERO, PAGE_GAP / 2.)));
+        }
+    }
+
+    /// Lays out pages for the given viewport and returns what to paint.
+    fn prepaint_pages(
+        &mut self,
+        viewport: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PagesPaint {
+        let item = self.pdf_item.read(cx);
+        let document = item.document().clone();
+        let generation = item.generation();
+
+        // Relayout, keeping the reading position stable across zoom, resize and reload.
+        let zoom = self.zoom_mode.resolve(&document.pages, viewport.size);
+        let needs_layout = self.layout.as_ref().is_none_or(|layout| {
+            layout.zoom != zoom
+                || layout.content_size.width < viewport.size.width
+                || layout.pages.len() != document.pages.len()
+                || self.layout_generation != generation
+        }) || self.scroll.viewport_bounds().size.width != viewport.size.width;
+        if needs_layout {
+            // A view resting at the very top stays there; the padding above the first
+            // page doesn't scale with zoom, so anchoring to it would drift.
+            if self.pending_anchor.is_none()
+                && self.layout.is_some()
+                && self.scroll.scroll_position().y > Pixels::ZERO
+            {
+                self.anchor_viewport_point(point(viewport.size.width / 2., Pixels::ZERO));
+            }
+            let layout = PageLayout::new(&document.pages, zoom, viewport.size.width);
+            if self.layout.as_ref().is_none_or(|old| old.zoom != zoom) {
+                self.zoom_changed_at = Instant::now();
+            }
+            self.layout = Some(layout);
+            self.layout_generation = generation;
+        }
+        let layout = self.layout.as_ref().expect("layout was just computed");
+        self.scroll.set_geometry(viewport, layout.content_size);
+        if let Some((anchor, viewport_point)) = self.pending_anchor.take()
+            && let Some(position) = layout.position_of(anchor)
+        {
+            let mut target = position - viewport_point;
+            // Don't scroll horizontally when the pages fit the viewport anyway.
+            if layout.content_size.width <= viewport.size.width {
+                target.x = Pixels::ZERO;
+            }
+            self.scroll.set_scroll_position(target);
+        }
+
+        // Pick the raster zoom, letting it trail the displayed zoom while it changes.
+        let raster_zoom = match self.raster_zoom {
+            Some(raster_zoom) if raster_zoom != zoom => {
+                let elapsed = self.zoom_changed_at.elapsed();
+                if elapsed >= RASTER_SETTLE {
+                    self.raster_zoom = Some(zoom);
+                    zoom
+                } else {
+                    let wait = RASTER_SETTLE - elapsed;
+                    self.settle_task = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(wait).await;
+                        this.update(cx, |_, cx| cx.notify()).ok();
+                    }));
+                    raster_zoom
+                }
+            }
+            _ => {
+                self.raster_zoom = Some(zoom);
+                zoom
+            }
+        };
+
+        let scale_factor = window.scale_factor();
+        let raster_scale = raster_zoom * scale_factor;
+        let scale_key = (raster_scale * 1024.).round() as u32;
+        let scroll_position = self.scroll.scroll_position();
+        let visible = Bounds::new(scroll_position, viewport.size);
+        // Prefetch half a screen above and below.
+        let margin = viewport.size.height / 2.;
+        let prefetch_range =
+            layout.pages_in_range(visible.top() - margin, visible.bottom() + margin);
+        let visible_range = layout.pages_in_range(visible.top(), visible.bottom());
+
+        self.tiles.frame += 1;
+        let frame = self.tiles.frame;
+        let mut wanted = HashSet::new();
+        let mut pages = Vec::new();
+        let border = cx.theme().colors().border_variant;
+
+        // Build search matches in document order, independently of the page cache's HashMap.
+        let query = self.search_query.trim().to_lowercase();
+        let mut search_matches = Vec::new();
+        if !query.is_empty() {
+            for page_index in 0..document.pages.len() {
+                let Some(PageTextState::Loaded(segments)) = self.page_text.pages.get(&page_index)
+                else {
+                    continue;
+                };
+
+                let mut matching_segments: Vec<_> = segments
+                    .iter()
+                    .filter(|segment| segment.text.to_lowercase().contains(&query))
+                    .collect();
+                matching_segments
+                    .sort_by(|a, b| a.y.total_cmp(&b.y).then_with(|| a.x.total_cmp(&b.x)));
+
+                let dimensions = document.pages[page_index];
+                for segment in matching_segments {
+                    search_matches.push(PdfBox {
+                        page_index,
+                        x: segment.x * dimensions.width,
+                        y: segment.y * dimensions.height,
+                        width: segment.width * dimensions.width,
+                        height: segment.height * dimensions.height,
+                    });
+                }
+            }
+        }
+
+        for page_index in prefetch_range {
+            let page_bounds = layout.pages[page_index];
+            let dimensions = document.pages[page_index];
+            let raster = raster_size(dimensions, raster_scale);
+            // Visible part of the page, expanded by the prefetch margin, in raster pixels.
+            let region = Bounds::from_corners(
+                point(visible.left(), visible.top() - margin),
+                point(visible.right(), visible.bottom() + margin),
+            );
+            if !page_bounds.intersects(&region) {
+                continue;
+            }
+            let region = page_bounds.intersect(&region);
+            let to_raster = raster_scale / layout.zoom;
+            let raster_region = Bounds::new(
+                point(
+                    f32::from(region.left() - page_bounds.left()) * to_raster,
+                    f32::from(region.top() - page_bounds.top()) * to_raster,
+                ),
+                size(
+                    f32::from(region.size.width) * to_raster,
+                    f32::from(region.size.height) * to_raster,
+                ),
+            );
+
+            let mut complete = true;
+            for tile in tiles_intersecting(raster, raster_region) {
+                let key = TileKey {
+                    generation,
+                    page_index,
+                    scale: scale_key,
+                    column: tile.column,
+                    row: tile.row,
+                };
+                wanted.insert(key);
+                if let Some(cached) = self.tiles.tiles.get_mut(&key) {
+                    cached.last_used = frame;
+                } else {
+                    complete = false;
+                    if !self.tiles.pending.contains_key(&key) && !self.tiles.failed.contains(&key) {
+                        let request = TileRequest {
+                            document: document.id,
+                            page_index,
+                            scale: raster_scale,
+                            x: tile.x,
+                            y: tile.y,
+                            width: tile.width,
+                            height: tile.height,
+                        };
+                        if let Some(pending) = self.request_tile(key, tile, request, cx) {
+                            self.tiles.pending.insert(key, pending);
+                        }
+                    }
+                }
+            }
+
+            if !visible_range.contains(&page_index) {
+                continue;
+            }
+
+            // Paint placeholders from other resolutions or document versions
+            // first, then the current tiles on top.
+            let page_origin = snap_point(
+                viewport.origin - scroll_position + page_bounds.origin,
+                scale_factor,
+            );
+            let page_rect = Bounds::new(page_origin, page_bounds.size);
+            let mut images: Vec<(u64, bool, Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
+            for (key, cached) in &mut self.tiles.tiles {
+                if key.page_index != page_index {
+                    continue;
+                }
+                let is_current = wanted.contains(key);
+                if !is_current && complete {
+                    continue;
+                }
+                let to_logical = layout.zoom / cached.scale;
+                let left = page_origin.x + px(cached.tile.x as f32 * to_logical);
+                let top = page_origin.y + px(cached.tile.y as f32 * to_logical);
+                let right =
+                    page_origin.x + px((cached.tile.x + cached.tile.width) as f32 * to_logical);
+                let bottom =
+                    page_origin.y + px((cached.tile.y + cached.tile.height) as f32 * to_logical);
+                cached.last_used = frame;
+                images.push((
+                    if is_current {
+                        u64::MAX
+                    } else {
+                        cached.scale.to_bits() as u64
+                    },
+                    is_current,
+                    Bounds::from_corners(point(left, top), point(right, bottom)),
+                    cached.image.clone(),
+                ));
+            }
+            images.sort_by_key(|(order, ..)| *order);
+            let highlights = self
+                .highlight
+                .iter()
+                .filter(|pdf_box| pdf_box.page_index == page_index)
+                .map(|pdf_box| {
+                    let to_pixels = |points: f32| px(points * layout.zoom);
+                    Bounds::new(
+                        page_origin
+                            + point(
+                                to_pixels(pdf_box.x - HIGHLIGHT_PADDING),
+                                to_pixels(pdf_box.y - HIGHLIGHT_PADDING),
+                            ),
+                        size(
+                            to_pixels(pdf_box.width + 2. * HIGHLIGHT_PADDING),
+                            to_pixels(pdf_box.height + 2. * HIGHLIGHT_PADDING),
+                        ),
+                    )
+                })
+                .collect();
+            let search_highlights = search_matches
+                .iter()
+                .enumerate()
+                .filter(|(_, pdf_box)| pdf_box.page_index == page_index)
+                .map(|(match_index, pdf_box)| {
+                    let to_pixels = |points: f32| px(points * layout.zoom);
+                    let bounds = Bounds::new(
+                        page_origin + point(to_pixels(pdf_box.x), to_pixels(pdf_box.y)),
+                        size(to_pixels(pdf_box.width), to_pixels(pdf_box.height)),
+                    );
+                    (bounds, match_index == self.search_current_match)
+                })
+                .collect();
+
+            pages.push(PagePaint {
+                bounds: page_rect,
+                images: images
+                    .into_iter()
+                    .map(|(_, _, bounds, image)| (bounds, image))
+                    .collect(),
+                highlights,
+                search_highlights,
+            });
+        }
+
+        // Stop rendering tiles that scrolled out of range.
+        self.tiles.pending.retain(|key, _| wanted.contains(key));
+        self.tiles.evict(window);
+
+        for page_index in visible_range {
+            self.request_links(page_index, document.id, generation, cx);
+        }
+
+        PagesPaint { pages, border }
+    }
+
+    fn request_tile(
+        &self,
+        key: TileKey,
+        tile: TileRect,
+        request: TileRequest,
+        cx: &mut Context<Self>,
+    ) -> Option<PendingTile> {
+        let worker = PdfWorker::global().log_err()?;
+        let (tx, rx) = oneshot::channel();
+        let ticket = worker.render(request, move |result| {
+            tx.send(result).ok();
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = rx.await.context("render was cancelled");
+            let image = result.and_then(|result| result).and_then(|rendered| {
+                render_image(rendered).context("tile buffer has the wrong size")
+            });
+            this.update(cx, |this, cx| {
+                this.tiles.pending.remove(&key);
+                match image {
+                    Ok(image) => {
+                        this.tiles.tiles.insert(
+                            key,
+                            CachedTile {
+                                image: Arc::new(image),
+                                tile,
+                                scale: request.scale,
+                                last_used: this.tiles.frame,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        log::error!("failed to render PDF tile {key:?}: {error:#}");
+                        this.tiles.failed.insert(key);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        Some(PendingTile {
+            _ticket: ticket,
+            _task: task,
+        })
+    }
+
+    fn request_thumbnail(
+        &self,
+        key: (u64, usize),
+        request: TileRequest,
+        cx: &mut Context<Self>,
+    ) -> Option<PendingTile> {
+        let worker = PdfWorker::global().log_err()?;
+        let (tx, rx) = oneshot::channel();
+        let ticket = worker.render(request, move |result| {
+            tx.send(result).ok();
+        });
+
+        let task = cx.spawn(async move |this, cx| {
+            let result = rx.await.context("thumbnail render was cancelled");
+            let image = result.and_then(|result| result).and_then(|rendered| {
+                render_image(rendered).context("thumbnail buffer has the wrong size")
+            });
+
+            this.update(cx, |this, cx| {
+                this.thumbnails.pending.remove(&key);
+                match image {
+                    Ok(image) => {
+                        this.thumbnails.images.insert(key, Arc::new(image));
+                    }
+                    Err(error) => {
+                        log::error!("failed to render PDF thumbnail {key:?}: {error:#}");
+                        this.thumbnails.failed.insert(key);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+
+        Some(PendingTile {
+            _ticket: ticket,
+            _task: task,
+        })
+    }
+}
+
+fn render_image(tile: RenderedTile) -> Option<RenderImage> {
+    // GPUI treats image bytes as BGRA, which is what the worker produces.
+    let buffer = RgbaImage::from_raw(tile.width, tile.height, tile.bgra)?;
+    Some(RenderImage::new(smallvec![Frame::new(buffer)]))
+}
+
+fn snap_point(position: Point<Pixels>, scale_factor: f32) -> Point<Pixels> {
+    position.map(|coordinate| px((f32::from(coordinate) * scale_factor).round() / scale_factor))
+}
+
+struct PagePaint {
+    bounds: Bounds<Pixels>,
+    images: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
+    /// Boxes highlighted by a SyncTeX jump.
+    highlights: Vec<Bounds<Pixels>>,
+    /// Search matches and whether each is the selected match.
+    search_highlights: Vec<(Bounds<Pixels>, bool)>,
+}
+
+struct PagesPaint {
+    pages: Vec<PagePaint>,
+    border: Hsla,
+}
+
+/// Paints the visible pages; layout and tile scheduling happen in prepaint.
+struct PagesElement {
+    view: Entity<PdfView>,
+}
+
+impl IntoElement for PagesElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for PagesElement {
+    type RequestLayoutState = ();
+    type PrepaintState = PagesPaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let style = Style {
+            size: size(relative(1.).into(), relative(1.).into()),
+            ..Default::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> PagesPaint {
+        self.view
+            .update(cx, |view, cx| view.prepaint_pages(bounds, window, cx))
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        paint: &mut PagesPaint,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for page in &paint.pages {
+                window.paint_drop_shadows(
+                    page.bounds,
+                    Corners::default(),
+                    &[BoxShadow {
+                        color: hsla(0., 0., 0., 0.18),
+                        offset: point(px(0.), px(1.)),
+                        blur_radius: px(4.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    }],
+                );
+                // PDF pages are paper: always drawn on white, as the document intends.
+                window.paint_quad(fill(page.bounds, gpui::white()));
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: page.bounds,
+                    }),
+                    |window| {
+                        for (image_bounds, image) in &page.images {
+                            window
+                                .paint_image(
+                                    page.bounds,
+                                    *image_bounds,
+                                    Corners::default(),
+                                    image.clone(),
+                                    0,
+                                    false,
+                                )
+                                .log_err();
+                        }
+                        for (highlight, is_current) in &page.search_highlights {
+                            let color = if *is_current {
+                                hsla(30. / 360., 1., 0.5, 0.55)
+                            } else {
+                                hsla(210. / 360., 1., 0.55, 0.28)
+                            };
+                            window.paint_quad(fill(*highlight, color));
+                        }
+                        for highlight in &page.highlights {
+                            window.paint_quad(fill(*highlight, hsla(50. / 360., 1., 0.5, 0.35)));
+                        }
+                    },
+                );
+                window.paint_quad(outline(page.bounds, paint.border, Default::default()));
+            }
+        });
+    }
+}
+
+impl EventEmitter<PdfViewEvent> for PdfView {}
+
+impl Focusable for PdfView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for PdfView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_dragging = self.drag_position.is_some();
+        let (document, generation) = {
+            let item = self.pdf_item.read(cx);
+            (item.document().clone(), item.generation())
+        };
+        let page_count = document.pages.len();
+        let thumbnail_page = self
+            .layout
+            .as_ref()
+            .map(|layout| {
+                let scroll_y = self.scroll.scroll_position().y;
+                layout
+                    .pages
+                    .partition_point(|page| page.bottom() < scroll_y)
+                    .min(layout.pages.len().saturating_sub(1))
+            })
+            .unwrap_or(0);
+
+        if self.thumbnails_visible {
+            self.thumbnails.images.retain(|(g, _), _| *g == generation);
+            self.thumbnails.pending.retain(|(g, _), _| *g == generation);
+            self.thumbnails.failed.retain(|(g, _)| *g == generation);
+        }
+
+        // Build the page list and request thumbnails when the sidebar is open.
+        let mut page_list = v_flex()
+            .id("pdf-thumbnail-list")
+            .flex_1()
+            .overflow_y_scroll()
+            .gap_1()
+            .px_2()
+            .py_2();
+
+        for page_index in 0..page_count {
+            let page_label = format!("Page {}", page_index + 1);
+            let key = (generation, page_index);
+            let dimensions = document.pages[page_index];
+
+            if self.thumbnails_visible
+                && !self.thumbnails.images.contains_key(&key)
+                && !self.thumbnails.pending.contains_key(&key)
+                && !self.thumbnails.failed.contains(&key)
+            {
+                let scale = (120.0 / dimensions.width).min(4096.0 / dimensions.height);
+                let request = TileRequest {
+                    document: document.id,
+                    page_index,
+                    scale,
+                    x: 0,
+                    y: 0,
+                    width: (dimensions.width * scale).ceil().max(1.0) as u32,
+                    height: (dimensions.height * scale).ceil().max(1.0) as u32,
+                };
+
+                if let Some(pending) = self.request_thumbnail(key, request, cx) {
+                    self.thumbnails.pending.insert(key, pending);
+                }
+            }
+
+            let thumbnail = self.thumbnails.images.get(&key).cloned();
+            let thumbnail_height = px(120.0 * dimensions.height / dimensions.width);
+
+            let page_button = div()
+                .id(format!("pdf-thumbnail-page-{page_index}"))
+                .w_full()
+                .px_2()
+                .py_2()
+                .when(page_index == thumbnail_page, |this| {
+                    this.bg(cx.theme().colors().element_selected)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.go_to_page(page_index, cx);
+                }))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(match thumbnail {
+                            Some(image) => div()
+                                .w_full()
+                                .h(thumbnail_height)
+                                .child(img(image).size_full()),
+                            None => div()
+                                .w_full()
+                                .h(thumbnail_height)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child("Loading…"),
+                        })
+                        .child(page_label),
+                );
+
+            page_list = page_list.child(page_button);
+        }
+
+        let sidebar = v_flex()
+            .id("pdf-thumbnail-sidebar")
+            .w(px(160.))
+            .h_full()
+            .flex_none()
+            .child(h_flex().w_full().px_2().py_2().child("Pages"))
+            .child(page_list);
+
+        v_flex()
+            .track_focus(&self.focus_handle)
+            .key_context("PdfViewer")
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::actual_size))
+            .on_action(cx.listener(Self::fit_width))
+            .on_action(cx.listener(Self::fit_page))
+            .on_action(cx.listener(Self::next_page))
+            .on_action(cx.listener(Self::previous_page))
+            .on_action(cx.listener(Self::first_page))
+            .on_action(cx.listener(Self::last_page))
+            .on_action(cx.listener(Self::scroll_up))
+            .on_action(cx.listener(Self::scroll_down))
+            .on_action(cx.listener(Self::scroll_page_up))
+            .on_action(cx.listener(Self::scroll_page_down))
+            .on_action(cx.listener(Self::go_to_page_action))
+            .on_action(cx.listener(Self::toggle_thumbnails))
+            .on_action(cx.listener(Self::find_in_pdf))
+            .on_action(cx.listener(Self::close_search))
+            .on_action(cx.listener(Self::next_search_match))
+            .on_action(cx.listener(Self::previous_search_match))
+            .on_action(cx.listener(Self::reveal_in_file_manager))
+            .size_full()
+            .bg(cx.theme().colors().background)
+            .when_some(self.search_editor.clone(), |this, editor| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child("Find")
+                        .child(div().w(px(320.)).child(editor))
+                        .child({
+                            let count = self.search_match_count();
+                            if count == 0 {
+                                "0 of 0".to_string()
+                            } else {
+                                format!(
+                                    "{} of {}",
+                                    self.search_current_match.min(count - 1) + 1,
+                                    count
+                                )
+                            }
+                        }),
+                )
+            })
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("pdf-thumbnail-toggle")
+                            .w(px(68.))
+                            .h_full()
+                            .flex_none()
+                            .px_2()
+                            .py_2()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.thumbnails_visible = !this.thumbnails_visible;
+                                cx.notify();
+                            }))
+                            .child("Pages"),
+                    )
+                    .when(self.thumbnails_visible, |this| this.child(sidebar))
+                    .child(
+                        div()
+                            .id("pdf-pages")
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .cursor(if is_dragging {
+                                gpui::CursorStyle::ClosedHand
+                            } else if self.hovering_link {
+                                gpui::CursorStyle::PointingHand
+                            } else {
+                                gpui::CursorStyle::Arrow
+                            })
+                            .on_scroll(cx.listener(Self::handle_scroll_wheel))
+                            .on_pinch(cx.listener(Self::handle_pinch))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(Self::handle_mouse_down),
+                            )
+                            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+                            .on_mouse_up(
+                                MouseButton::Middle,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_drag(cx)),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_drag(cx)),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Middle,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_drag(cx)),
+                            )
+                            .child(PagesElement { view: cx.entity() })
+                            .custom_scrollbars(
+                                Scrollbars::new(ScrollAxes::Both)
+                                    .tracked_scroll_handle(&self.scroll)
+                                    .tracked_entity(cx.entity_id()),
+                                window,
+                                cx,
+                            ),
+                    ),
+            )
+    }
+}
+
+impl Item for PdfView {
+    type Event = PdfViewEvent;
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        match event {
+            PdfViewEvent::TitleChanged => {
+                f(ItemEvent::UpdateTab);
+                f(ItemEvent::UpdateBreadcrumbs);
+            }
+            PdfViewEvent::StateChanged => {}
+        }
+    }
+
+    fn for_each_project_item(
+        &self,
+        cx: &App,
+        f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
+    ) {
+        f(self.pdf_item.entity_id(), self.pdf_item.read(cx))
+    }
+
+    fn set_nav_history(
+        &mut self,
+        nav_history: ItemNavHistory,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.nav_history = Some(nav_history);
+    }
+
+    fn navigate(
+        &mut self,
+        data: Arc<dyn Any + Send>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(anchor) = data.downcast_ref::<PageAnchor>().copied() else {
+            return false;
+        };
+        // While going back this lands in the forward history, and vice versa.
+        self.push_to_nav_history(cx);
+        self.pending_anchor = Some((anchor, point(Pixels::ZERO, PAGE_GAP / 2.)));
+        self.state_changed(cx);
+        cx.notify();
+        true
+    }
+
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.workspace = Some(workspace.weak_handle());
+    }
+
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        let pdf_item = self.pdf_item.read(cx);
+        let path = pdf_item
+            .abs_path(cx)
+            .map(|abs_path| abs_path.compact())
+            .unwrap_or_else(|| pdf_item.file().full_path(cx));
+        Some(path.to_string_lossy().into_owned().into())
+    }
+
+    fn tab_content(&self, params: TabContentParams, _: &Window, cx: &App) -> AnyElement {
+        let project_path = self.pdf_item.read(cx).project_path(cx);
+        let label_color = if ItemSettings::get_global(cx).git_status {
+            let git_status = self
+                .project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .display_status_for_project_path(&project_path, cx)
+                .map(|status| status.summary())
+                .unwrap_or_default();
+            self.project
+                .read(cx)
+                .entry_for_path(&project_path, cx)
+                .map(|entry| {
+                    entry_git_aware_label_color(git_status, entry.is_ignored, params.selected)
+                })
+                .unwrap_or_else(|| params.text_color())
+        } else {
+            params.text_color()
+        };
+
+        Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
+            .single_line()
+            .color(label_color)
+            .when(params.preview, |this| this.italic())
+            .when(self.pdf_item.read(cx).is_deleted(), |this| {
+                this.strikethrough()
+            })
+            .into_any_element()
+    }
+
+    fn tab_content_text(&self, _: usize, cx: &App) -> SharedString {
+        self.pdf_item
+            .read(cx)
+            .file()
+            .file_name(cx)
+            .to_string()
+            .into()
+    }
+
+    fn tab_icon(&self, _: &Window, cx: &App) -> Option<Icon> {
+        // The full path includes the root name, which is the file name when the PDF
+        // was opened on its own and its project path is empty.
+        let path = self.pdf_item.read(cx).file().full_path(cx);
+        ItemSettings::get_global(cx)
+            .file_icons
+            .then(|| FileIcons::get_icon(&path, cx))
+            .flatten()
+            .map(Icon::from_path)
+    }
+
+    fn breadcrumb_location(&self, cx: &App) -> ToolbarItemLocation {
+        if EditorSettings::get_global(cx).toolbar.breadcrumbs {
+            ToolbarItemLocation::PrimaryLeft
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+
+    fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)> {
+        let project = self.project.read(cx);
+        let item = self.pdf_item.read(cx);
+        let mut path = item.file().path().to_rel_path_buf();
+        // A file opened on its own is the worktree root, so its relative path is
+        // empty; the root name is the file name then.
+        if (path.is_empty() || project.visible_worktrees(cx).count() > 1)
+            && let Some(worktree) = project.worktree_for_id(item.project_path(cx).worktree_id, cx)
+        {
+            path = worktree.read(cx).root_name().join(&path);
+        }
+        let mut text = path.display(project.path_style(cx)).to_string();
+        if let Some(title) = &item.document().title {
+            text.push_str(" - ");
+            text.push_str(title);
+        }
+        Some((
+            vec![HighlightedText {
+                text: text.into(),
+                highlights: vec![],
+            }],
+            Some(ThemeSettings::get_global(cx).buffer_font.clone()),
+        ))
+    }
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
+    fn clone_on_split(
+        &self,
+        _: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>> {
+        let state = self.serialized_state();
+        let pdf_item = self.pdf_item.clone();
+        let project = self.project.clone();
+        Task::ready(Some(cx.new(|cx| {
+            let mut view = PdfView::new(pdf_item, project, window, cx);
+            view.restore_state(state);
+            view
+        })))
+    }
+
+    fn has_deleted_file(&self, cx: &App) -> bool {
+        self.pdf_item.read(cx).is_deleted()
+    }
+
+    fn buffer_kind(&self, _: &App) -> workspace::item::ItemBufferKind {
+        workspace::item::ItemBufferKind::Singleton
+    }
+}
+
+impl ProjectItem for PdfView {
+    type Item = PdfItem;
+
+    fn for_project_item(
+        project: Entity<Project>,
+        _: Option<&Pane>,
+        item: Entity<Self::Item>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(item, project, window, cx)
+    }
+
+    fn for_broken_project_item(
+        abs_path: &Path,
+        is_local: bool,
+        error: &anyhow::Error,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<InvalidItemView> {
+        Some(InvalidItemView::new(abs_path, is_local, error, window, cx))
+    }
+}
+
+impl SerializableItem for PdfView {
+    fn serialized_item_kind() -> &'static str {
+        "PdfView"
+    }
+
+    fn deserialize(
+        project: Entity<Project>,
+        _workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        let db = PdfViewerDb::global(cx);
+        window.spawn(cx, async move |cx| {
+            let (pdf_path, view_state) = db
+                .get_pdf(item_id, workspace_id)?
+                .context("no PDF path found")?;
+            let pdf_item = PdfItem::open_abs_path(project.clone(), pdf_path, cx).await?;
+            let state = serde_json::from_str::<SerializedViewState>(&view_state).log_err();
+            cx.update(|window, cx| {
+                cx.new(|cx| {
+                    let mut view = PdfView::new(pdf_item, project, window, cx);
+                    if let Some(state) = state {
+                        view.restore_state(state);
+                    }
+                    view
+                })
+            })
+        })
+    }
+
+    fn cleanup(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<ItemId>,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        let db = PdfViewerDb::global(cx);
+        delete_unloaded_items(alive_items, workspace_id, "pdf_viewers", &db, cx)
+    }
+
+    fn serialize(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        let workspace_id = workspace.database_id()?;
+        // Save the path on the host rather than on this computer, so PDFs in
+        // remote projects are restored too.
+        let pdf_path = self.pdf_item.read(cx).path_on_host(cx);
+        let view_state = serde_json::to_string(&self.serialized_state()).log_err()?;
+        let db = PdfViewerDb::global(cx);
+        Some(cx.background_spawn(async move {
+            db.save_pdf(item_id, workspace_id, pdf_path, view_state)
+                .await
+        }))
+    }
+
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(event, PdfViewEvent::StateChanged)
+    }
+}
+
+#[cfg(test)]
+#[path = "pdf_view_tests.rs"]
+mod tests;
